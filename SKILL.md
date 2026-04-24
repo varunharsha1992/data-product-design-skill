@@ -101,13 +101,13 @@ Document this in the `contract.yml` header. See `references/contract-template.ym
 
 ### Step 2 — Design the Physical Model (Bronze → Silver → Gold)
 
-For each layer, define the tables. Use ERD notation from the `data-modeling` skill for relationships. Apply medallion patterns from `medallion-architecture` for incremental processing and quality checks.
+For each layer, define the tables. Use Crow's Foot ERD notation for relationships (see `references/data-modeling-guide.md` for notation, normalization, type mapping, and data dictionary format). Apply the layer patterns in `references/layer-patterns.md` for incremental processing, quality checks, and optimization.
 
-**Bronze tables** — one per source feed. Minimal transformation. Schema-flexible.
+**Bronze tables** — one per source feed. Append-only, schema-flexible, metadata-enriched. No transformation or business logic. Read `references/layer-patterns.md § Bronze Layer Patterns`.
 
-**Silver tables** — one per logical entity. Normalized, typed, deduplicated. Apply the data-modeling skill's normalization workflow here (1NF → 3NF). Define keys, relationships, and constraints.
+**Silver tables** — one per logical entity. Normalized (1NF → 3NF), typed, deduplicated, business-rule-applied. Define keys, relationships, and constraints using the normalization and physical model guidance in `references/data-modeling-guide.md`. Read `references/layer-patterns.md § Silver Layer Patterns` for transformation sequence, merge strategy, and quality gates.
 
-**Gold tables** — conformed fact and dimension tables only. No aggregated KPI tables. Define surrogate keys, slowly-changing dimension (SCD) strategy if applicable, and partitioning strategy.
+**Gold tables** — conformed fact and dimension tables only. No aggregated KPI tables. Follow the star schema pattern. Define surrogate keys, SCD strategy if applicable, and partitioning strategy. Read `references/layer-patterns.md § Gold Layer Patterns`.
 
 Output: a data model spec with ERD per layer and a table spec for each table (name, columns, types, keys, partitioning, refresh strategy). Use the format in `references/contract-template.yml` under `physical_layer`.
 
@@ -121,17 +121,17 @@ Output: a data model spec with ERD per layer and a table spec for each table (na
 
 ### Step 3 — Define the Transactional Layer
 
-Identify which Silver entities need fast serving. For each, specify:
-- The read pattern (point lookup? range query? key used?)
-- The sync mechanism (CDC from Silver, scheduled job, event-driven)
+Identify which Silver entities need fast app-facing access. For each, specify:
+- The read pattern (point lookup? range query? what key?)
+- The sync mechanism (scheduled job, CDC, streaming — see `references/layer-patterns.md § Transactional Layer Patterns` for guidance)
 - The freshness SLA
-- The target store (in-memory cache, PostgreSQL, Redis, or Delta + Photon row cache)
+- The target store (Delta with cache, PostgreSQL, Redis — see the selection table in layer-patterns.md)
 
-Output: transactional layer spec block in `contract.yml`.
+Output: transactional layer spec block in `contract.yml`. Read `references/layer-patterns.md § Transactional Layer Patterns` before designing this layer — in particular the rule about when not to use it.
 
 ### Step 4 — Define Metrics (Semantic Layer)
 
-For each KPI or business metric the data product must expose, write a MetricFlow-style spec. These are YAML definitions that become the metric contract — independent of whether the execution target is Databricks Metric Views or dbt MetricFlow on DuckDB.
+For each KPI or business metric the data product must expose, write a MetricFlow-style spec. These are YAML definitions that become the metric contract — independent of whether the execution target is Databricks Metric Views or dbt MetricFlow on DuckDB. See `references/layer-patterns.md § Semantic Layer Patterns` for metric types, dimension handling, and design rules.
 
 ```yaml
 metrics:
@@ -276,10 +276,11 @@ A complete data product design produces:
 
 ## Reference Files
 
-- `references/contract-template.yml` — full annotated `contract.yml` template
-- `references/job-spec-template.yml` — job and simulation spec template with all fields
+All reference files are bundled within this skill — no external dependencies.
 
-## Related Skills
-
-- `data-modeling` — ERD notation, normalization, physical model design
-- `medallion-architecture` — Bronze/Silver/Gold implementation patterns, incremental pr
+| File | Contents | Read when |
+|---|---|---|
+| `references/contract-template.yml` | Fully annotated `contract.yml` template with supply chain examples | Step 1 and Step 7 |
+| `references/job-spec-template.yml` | Job and simulation spec templates (ingestion, transformation, sync, simulation) | Step 5 and Step 6 |
+| `references/data-modeling-guide.md` | ERD notation (Crow's Foot + Mermaid), normalization (1NF–3NF), SCD strategies, physical type mapping, data dictionary format | Step 2 |
+| `references/layer-patterns.md` | Bronze/Silver/Gold/Transactional/Semantic layer patterns, incremental processing, quality checks per layer, optimization strategies, anti-patterns | Steps 2–4 |
