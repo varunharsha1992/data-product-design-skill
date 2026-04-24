@@ -1,0 +1,265 @@
+# Job Spec Template
+# Use one file per job. Place in jobs/ directory within your data product package.
+# These are specs — not code. The orchestration layer implements them.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INGESTION JOB EXAMPLE
+# ══════════════════════════════════════════════════════════════════════════════
+job:
+  name: ingest_demand_raw                # (required) snake_case, unique within product
+  type: ingestion                        # ingestion | transformation | aggregation | sync | simulation
+  description: "Ingests demand actuals from ERP system into Bronze layer"
+
+  trigger:
+    type: scheduled                      # scheduled | event | on_demand | streaming
+    schedule: "0 */4 * * *"             # cron expression (if scheduled)
+    # event_source: s3_put_object        # (if event) what triggers this job
+    # depends_on: [upstream_job_name]    # (if event) upstream job completion
+
+  inputs:
+    - name: erp_demand_export
+      type: file                         # file | table | api | stream
+      format: csv
+      location: "s3://raw-data/erp/demand/"
+      schema_enforcement: false          # bronze ingestion is schema-flexible
+      expected_row_count_min: 100        # alert if below this
+
+  outputs:
+    - name: bronze_demand_raw
+      layer: bronze
+      table: "demand_planning.bronze_demand_raw"
+      write_mode: append                 # append | overwrite | merge
+      add_metadata_columns:
+        - _ingested_at: current_timestamp()
+        - _source_system: "'erp'"
+        - _source_file: input_file_name()
+
+  quality_checks:
+    pre_job:
+      - file_exists: true
+      - file_not_empty: true
+    post_job:
+      - row_count_increased: true        # new rows were written
+      - no_schema_regression: true       # column count didn't drop
+
+  sla:
+    max_duration_minutes: 30
+    freshness_sla_hours: 4              # data must not be older than this
+    alert_on_breach: true
+
+  compute:
+    tier: serverless                     # serverless | standard_cluster | sql_warehouse
+    # On lightweight stack: use Spark submit or DuckDB depending on volume
+
+  retry:
+    max_attempts: 3
+    backoff_minutes: 5
+
+  notifications:
+    on_failure: [team-sc-platform@company.com]
+    on_sla_breach: [team-sc-platform@company.com]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRANSFORMATION JOB EXAMPLE (Bronze → Silver)
+# ══════════════════════════════════════════════════════════════════════════════
+---
+job:
+  name: transform_demand_silver
+  type: transformation
+  description: "Cleans and conforms demand raw data into Silver fact table"
+
+  trigger:
+    type: event
+    depends_on: [ingest_demand_raw]      # runs when upstream completes successfully
+
+  inputs:
+    - name: bronze_demand_raw
+      type: table
+      table: "demand_planning.bronze_demand_raw"
+      incremental: true                  # process only new records since last watermark
+      watermark_column: _ingested_at
+
+  outputs:
+    - name: silver_fct_demand
+      layer: silver
+      table: "demand_planning.silver_fct_demand"
+      write_mode: merge
+      merge_key: [order_id]
+
+  transformations:
+    - step: deduplicate
+      key: [order_id]
+      keep: latest                       # keep | first
+    - step: cast_types
+      mappings:
+        - column: quantity_ordered
+          from: string
+          to: integer
+        - column: order_date
+          from: string
+          to: date
+          format: "yyyy-MM-dd"
+    - step: filter_nulls
+      columns: [order_id, sku_id, order_date]
+    - step: standardize_values
+      column: status
+      mapping:
+        "fulfilled": "FULFILLED"
+        "open": "OPEN"
+        "cancelled": "CANCELLED"
+    - step: enrich
+      join_table: "demand_planning.gold_dim_products"
+      join_key: sku_id
+      add_columns: [category, lead_time_days]
+
+  quality_checks:
+    post_job:
+      - no_nulls: [order_id, sku_id, quantity_ordered, order_date]
+      - no_duplicates: [order_id]
+      - positive_values: [quantity_ordered]
+      - referential_integrity:
+          column: sku_id
+          references: "demand_planning.gold_dim_products.sku_id"
+      - row_count_delta_percent_max: 20  # alert if > 20% row count change vs prior run
+
+  sla:
+    max_duration_minutes: 45
+    freshness_sla_hours: 5
+    alert_on_breach: true
+
+  compute:
+    tier: serverless
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SYNC JOB EXAMPLE (Silver → Transactional Layer)
+# ══════════════════════════════════════════════════════════════════════════════
+---
+job:
+  name: sync_stock_positions
+  type: sync
+  description: "Syncs current stock positions from Silver to transactional cache for real-time ATP queries"
+
+  trigger:
+    type: scheduled
+    schedule: "*/15 * * * *"            # every 15 minutes
+
+  inputs:
+    - name: silver_fct_inventory_positions
+      type: table
+      table: "inventory.silver_fct_inventory_positions"
+      incremental: true
+      watermark_column: updated_at
+
+  outputs:
+    - name: current_stock_positions
+      layer: transactional
+      target_store: delta_with_cache     # delta_with_cache | postgresql | redis
+      table: "serving.current_stock_positions"
+      write_mode: merge
+      merge_key: [sku_id, warehouse_id]
+      index_columns: [sku_id, warehouse_id]  # ensure lookup index exists
+
+  quality_checks:
+    post_job:
+      - latency_check: true             # verify serving store is reachable
+      - row_count_nonzero: true
+
+  sla:
+    max_duration_minutes: 5
+    freshness_sla_minutes: 20
+    alert_on_breach: true
+
+  compute:
+    tier: serverless
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIMULATION JOB SPEC EXAMPLE (On-Demand)
+# ══════════════════════════════════════════════════════════════════════════════
+---
+simulation:
+  name: reorder_point_sim
+  type: simulation
+  description: "Calculates optimal reorder points given variable supplier lead times and target service levels"
+
+  trigger:
+    type: on_demand                      # always on_demand for simulations
+    api_endpoint: true                   # expose as callable API endpoint
+
+  parameters:                            # inputs provided by the caller at runtime
+    - name: scenario_id
+      type: string
+      required: true
+      description: "Unique identifier for this simulation run"
+    - name: supplier_id
+      type: string
+      required: true
+      description: "Supplier to model lead time changes for"
+    - name: lead_time_delta_days
+      type: integer
+      required: false
+      default: 0
+      description: "Change in lead time days (positive = longer, negative = shorter)"
+    - name: service_level_target
+      type: float
+      required: false
+      default: 0.95
+      description: "Target in-stock service level (0.0–1.0)"
+
+  inputs:
+    - name: inventory_positions
+      type: table
+      table: "inventory.silver_fct_inventory_positions"
+      filter: "supplier_id = :supplier_id"
+    - name: demand_history
+      type: table
+      table: "demand_planning.silver_fct_demand"
+      lookback_days: 90
+    - name: supplier_master
+      type: table
+      table: "procurement.gold_dim_suppliers"
+      filter: "supplier_id = :supplier_id"
+
+  outputs:
+    - name: reorder_point_results
+      layer: simulation
+      table: "simulations.reorder_point_results"
+      write_mode: append                 # simulations always append — never overwrite
+      partition_columns: [scenario_id, run_date]
+      schema:
+        - name: scenario_id
+          type: string
+        - name: sku_id
+          type: string
+        - name: supplier_id
+          type: string
+        - name: current_reorder_point
+          type: integer
+        - name: recommended_reorder_point
+          type: integer
+        - name: delta
+          type: integer
+        - name: confidence_interval_low
+          type: integer
+        - name: confidence_interval_high
+          type: integer
+        - name: assumptions
+          type: map<string, string>      # captures input parameters used
+        - name: run_timestamp
+          type: timestamp
+
+  quality_checks:
+    post_job:
+      - output_rows_gt: 0
+      - no_nulls: [scenario_id, sku_id, recommended_reorder_point]
+      - values_positive: [recommended_reorder_point]
+
+  sla:
+    max_duration_minutes: 10
+    alert_on_breach: true
+
+  compute:
+    tier: serverless
+    auto_scale: true

@@ -1,0 +1,225 @@
+# Data Product Contract Template
+# Fill in all fields. Fields marked (required) must be present for catalog registration.
+# Fields marked (optional) are recommended but can be deferred.
+
+# ── IDENTITY ──────────────────────────────────────────────────────────────────
+name: demand_planning                    # (required) snake_case, unique within catalog
+domain: supply_chain                     # (required) top-level domain
+version: "1.0.0"                         # (required) semver
+description: >
+  Provides demand actuals, forecasts, and planning metrics for the supply
+  chain planning domain. Exposes fill rate, forecast accuracy, and
+  on-demand reorder point simulations.
+owner:
+  team: supply_chain_platform            # (required)
+  contact: team-sc-platform@company.com  # (required)
+status: active                           # active | draft | deprecated
+
+# ── SLA ───────────────────────────────────────────────────────────────────────
+sla:
+  data_freshness_hours: 4               # max age of silver/gold data
+  availability_percent: 99.5
+  support_hours: business_hours         # business_hours | 24x7
+
+# ── PHYSICAL LAYER ────────────────────────────────────────────────────────────
+# List every table this data product owns. Consumers discover tables here.
+physical_layer:
+  catalog: supply_chain                  # Unity Catalog catalog name (or equivalent)
+  schema: demand_planning                # schema = data product boundary
+
+  tables:
+    # BRONZE
+    - name: bronze_demand_raw
+      layer: bronze
+      description: "Raw demand feed from ERP, append-only"
+      format: delta                      # delta | iceberg
+      partitioned_by: [ingestion_date]
+      refresh:
+        trigger: scheduled
+        schedule: "0 */4 * * *"          # cron
+      primary_key: null                  # bronze tables are append-only, no PK
+      columns:
+        - name: order_id
+          type: string
+          nullable: false
+        - name: sku_id
+          type: string
+          nullable: false
+        - name: quantity_ordered
+          type: integer
+          nullable: false
+        - name: order_date
+          type: date
+          nullable: false
+        - name: _ingested_at
+          type: timestamp
+          nullable: false
+          description: "System metadata — ingestion timestamp"
+        - name: _source_system
+          type: string
+          nullable: false
+          description: "System metadata — source system identifier"
+
+    # SILVER
+    - name: silver_fct_demand
+      layer: silver
+      description: "Cleaned, deduplicated demand fact table"
+      format: delta
+      partitioned_by: [order_date]
+      refresh:
+        trigger: event                   # triggered by bronze job completion
+        depends_on: [ingest_demand_raw]
+      primary_key: [order_id]
+      scd_strategy: null                 # null | scd1 | scd2
+      quality_checks:
+        - no_nulls: [order_id, sku_id, quantity_ordered]
+        - positive_values: [quantity_ordered]
+        - no_duplicates: [order_id]
+      columns:
+        - name: order_id
+          type: string
+          nullable: false
+          key: primary
+        - name: sku_id
+          type: string
+          nullable: false
+          key: foreign
+          references: silver_dim_products.sku_id
+        - name: quantity_ordered
+          type: integer
+          nullable: false
+        - name: quantity_fulfilled
+          type: integer
+          nullable: true
+        - name: order_date
+          type: date
+          nullable: false
+        - name: status
+          type: string
+          nullable: false
+          allowed_values: [OPEN, FULFILLED, CANCELLED, PARTIAL]
+
+    # GOLD
+    - name: gold_dim_products
+      layer: gold
+      description: "Conformed product dimension with supply chain attributes"
+      format: delta
+      refresh:
+        trigger: scheduled
+        schedule: "0 2 * * *"
+      primary_key: [sku_id]
+      scd_strategy: scd2                 # track product attribute history
+      columns:
+        - name: sku_id
+          type: string
+          nullable: false
+          key: primary
+        - name: product_name
+          type: string
+          nullable: false
+        - name: category
+          type: string
+          nullable: false
+        - name: lead_time_days
+          type: integer
+          nullable: true
+        - name: valid_from
+          type: timestamp
+          nullable: false
+        - name: valid_to
+          type: timestamp
+          nullable: true
+        - name: is_current
+          type: boolean
+          nullable: false
+
+# ── TRANSACTIONAL LAYER ───────────────────────────────────────────────────────
+# Only define entities that need sub-second, app-facing read access.
+# This layer is a read projection — the lakehouse is still source of truth.
+transactional_layer:
+  enabled: true
+  entities:
+    - name: current_stock_positions
+      description: "Latest stock level per SKU per warehouse for real-time ATP"
+      source_table: silver_fct_inventory_positions
+      sync_mechanism: scheduled_job      # scheduled_job | cdc | event
+      sync_frequency_minutes: 15
+      read_pattern: point_lookup         # point_lookup | range_query
+      lookup_key: [sku_id, warehouse_id]
+      freshness_sla_minutes: 20
+      target_store: delta_with_cache     # delta_with_cache | postgresql | redis
+      latency_sla_ms: 200
+
+# ── SEMANTIC LAYER ────────────────────────────────────────────────────────────
+# Reference to metric definitions. Full definitions live in metrics.yml.
+# This block makes metrics discoverable from the catalog contract.
+semantic_layer:
+  metrics_file: metrics.yml
+  metrics_exposed:
+    - name: fill_rate
+      description: "Orders fulfilled / total orders in period"
+      dimensions: [region, warehouse_id, product_category, order_date]
+    - name: forecast_accuracy
+      description: "1 - abs(forecast - actuals) / actuals"
+      dimensions: [sku_id, region, forecast_horizon_days, week]
+    - name: inventory_turnover
+      description: "COGS / average inventory value"
+      dimensions: [sku_id, warehouse_id, fiscal_month]
+
+# ── SIMULATIONS ───────────────────────────────────────────────────────────────
+# On-demand compute jobs. Full specs live in simulations/*.yml.
+# This block makes simulations discoverable from the catalog contract.
+simulations_exposed:
+  - name: reorder_point_sim
+    description: "Recalculates reorder points given variable supplier lead times"
+    spec_file: simulations/reorder_point_sim.yml
+    trigger: on_demand
+    estimated_duration_minutes: 5
+  - name: atp_sim
+    description: "Available-to-promise calculation for a given order scenario"
+    spec_file: simulations/atp_sim.yml
+    trigger: on_demand
+    estimated_duration_minutes: 2
+
+# ── JOBS ──────────────────────────────────────────────────────────────────────
+# References to job specs. Full specs live in jobs/*.yml.
+jobs:
+  - spec_file: jobs/ingest_demand_raw.yml
+  - spec_file: jobs/transform_demand_silver.yml
+  - spec_file: jobs/load_demand_gold.yml
+  - spec_file: jobs/sync_stock_positions.yml
+
+# ── ACCESS POLICIES ───────────────────────────────────────────────────────────
+access_policies:
+  default_access: internal               # internal | restricted | public
+  row_filters:
+    - table: silver_fct_demand
+      description: "Planners see only their assigned region"
+      filter_expr: "region = current_user_region()"
+      applies_to_roles: [planner]
+  column_masks:
+    - table: gold_dim_products
+      column: cost_price
+      description: "Cost price masked for non-finance roles"
+      mask_expr: "NULL"
+      applies_to_roles: [planner, ops]
+
+# ── DATAFLOW LINEAGE ──────────────────────────────────────────────────────────
+# Human-readable lineage. Also document visually in dataflow.md.
+dataflow:
+  lineage:
+    - from: "source:erp_system"
+      to: "bronze:bronze_demand_raw"
+      via: "jobs/ingest_demand_raw.yml"
+    - from: "bronze:bronze_demand_raw"
+      to: "silver:silver_fct_demand"
+      via: "jobs/transform_demand_silver.yml"
+    - from: "silver:silver_fct_demand"
+      to: "gold:gold_dim_products"
+      via: "jobs/load_demand_gold.yml"
+    - from: "silver:silver_fct_demand"
+      to: "semantic:fill_rate"
+      via: "MetricFlow — computed on demand"
+    - from: "silver:silver_fct_inventory_positions"
+      to: "transactional:current_stock_positions"
+      via: "jobs/sync_stock_positions.yml"
